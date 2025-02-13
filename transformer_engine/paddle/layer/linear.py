@@ -43,6 +43,11 @@ from ..utils import (
     clear_tensor_data,
 )
 
+from ..fp8_quantize_analysis_utils import (
+    get_fp8_quantize_analysis_helper,
+    can_fp8_quantize_analysis,
+)
+
 __all__ = ["Linear"]
 
 
@@ -63,6 +68,7 @@ def _linear_fwd_fp8(
     tp_group: Union[dist_group_type, None],
     is_grad_enabled: bool,
     is_first_microbatch: bool = None,
+    micro_step: int = 0,
 ):
     """FP8 path of Linear Fwd"""
     fp8_dtype_forward = get_fp8_te_dtype(fp8_meta["recipe"], fprop_tensor=True)
@@ -77,6 +83,13 @@ def _linear_fwd_fp8(
     if not get_global_fp8_state().is_cudagraph_enabled():
         # if cuda graph is not enabled, we cast the weight here
         update_fp8_weights = is_first_microbatch is None or is_first_microbatch
+        if can_fp8_quantize_analysis():
+            with paddle.no_grad():
+                if fp8_meta["scaling_fwd"].amax_history.sum() != 0:
+                    amax = fp8_meta["scaling_fwd"].amax_history[:, weight_fp8_index.value].max()
+                else:
+                    amax = None
+
         if is_grad_enabled:
             if update_fp8_weights:
                 weight_fp8, weight_t_fp8 = cast_transpose(
@@ -97,6 +110,22 @@ def _linear_fwd_fp8(
                     fp8_dtype_forward,
                     out=weight_fp8,
                 )
+        if can_fp8_quantize_analysis():
+            with paddle.no_grad():
+                if amax is None:
+                    amax = weight.abs().max()
+
+        if can_fp8_quantize_analysis():
+            get_fp8_quantize_analysis_helper().add_tensor(
+                weight,
+                fp8_tensor=weight_fp8,
+                pname=weight.name,
+                micro_step=micro_step,
+                suffix="w",
+                fp8_dtype=int(fp8_dtype_forward),
+                amax=amax,
+                scale=fp8_meta["scaling_fwd"].scale[weight_fp8_index.value],
+            )
 
     out, _ = fp8_gemm(
         weight_fp8,
@@ -206,6 +235,7 @@ def _linear_fwd(
     is_grad_enabled: bool,
     is_first_microbatch: bool = None,
     gather_output: bool = False,
+    micro_step: int = 0,
 ):
     if fp8_enabled:
         out, weight_t_fp8 = _linear_fwd_fp8(
@@ -225,6 +255,7 @@ def _linear_fwd(
             tp_group,
             is_grad_enabled,
             is_first_microbatch,
+            micro_step,
         )
     else:
         out = _linear_fwd_non_fp8(
@@ -526,6 +557,7 @@ class _Linear(paddle.autograd.PyLayer):
         fuse_wgrad_accumulation: bool,
         is_first_microbatch: bool,
         gather_output: bool,
+        micro_step: int,
     ) -> paddle.Tensor:
         # Make sure input dimensions are compatible
         in_features = weight.shape[-1]
@@ -541,6 +573,18 @@ class _Linear(paddle.autograd.PyLayer):
         inputmat_t = None
         if fp8_enabled:
             fp8_dtype_forward = get_fp8_te_dtype(fp8_meta["recipe"], fprop_tensor=True)
+
+            if can_fp8_quantize_analysis():
+                with paddle.no_grad():
+                    if fp8_meta["scaling_fwd"].amax_history.sum() != 0:
+                        amax = (
+                            fp8_meta["scaling_fwd"]
+                            .amax_history[:, FP8FwdTensors.GEMM1_INPUT.value]
+                            .max()
+                        )
+                    else:
+                        amax = None
+
             if (
                 not fp8_meta["recipe"].override_linear_precision.wgrad
                 and is_grad_enabled
@@ -558,6 +602,23 @@ class _Linear(paddle.autograd.PyLayer):
                     fp8_meta["scaling_fwd"],
                     FP8FwdTensors.GEMM1_INPUT,
                     fp8_dtype_forward,
+                )
+
+            if can_fp8_quantize_analysis():
+                with paddle.no_grad():
+                    if amax is None:
+                        amax = inputmat_no_fp8.abs().max()
+
+            if can_fp8_quantize_analysis():
+                get_fp8_quantize_analysis_helper().add_tensor(
+                    inputmat_no_fp8,
+                    fp8_tensor=inputmat,
+                    pname=weight.name,
+                    micro_step=micro_step,
+                    suffix="x",
+                    fp8_dtype=int(fp8_dtype_forward),
+                    amax=amax,
+                    scale=fp8_meta["scaling_fwd"].scale[FP8FwdTensors.GEMM1_INPUT.value],
                 )
 
         # GEMM Fwd
@@ -581,6 +642,7 @@ class _Linear(paddle.autograd.PyLayer):
             is_grad_enabled,
             is_first_microbatch,
             gather_output,
+            micro_step,
         )
 
         if is_grad_enabled:
@@ -613,6 +675,7 @@ class _Linear(paddle.autograd.PyLayer):
             ctx.requires_bgrad = use_bias and not bias.stop_gradient
             ctx.is_first_microbatch = is_first_microbatch
             ctx.reduce_scatter_output = gather_output
+            ctx.micro_step = micro_step
 
         return out.reshape((-1, *inp.shape[1:-1], out.shape[-1]))
 
@@ -630,6 +693,17 @@ class _Linear(paddle.autograd.PyLayer):
                 fwd_scale_inverses,
             ) = saved_tensor_allow_none(ctx)
 
+            if can_fp8_quantize_analysis(fwd=False):
+                with paddle.no_grad():
+                    if ctx.fp8_meta["scaling_bwd"].amax_history.sum() != 0:
+                        amax = (
+                            ctx.fp8_meta["scaling_bwd"]
+                            .amax_history[:, FP8BwdTensors.GRAD_OUTPUT1.value]
+                            .max()
+                        )
+                    else:
+                        amax = None
+
             (
                 grad_output,
                 grad_output_c,
@@ -638,6 +712,36 @@ class _Linear(paddle.autograd.PyLayer):
             ) = TransformerEngineBaseLayer.grad_output_preprocess(
                 ctx, grad_output, ctx.parallel_mode == "row"
             )
+
+            if can_fp8_quantize_analysis(fwd=False):
+                with paddle.no_grad():
+                    if amax is None:
+                        amax = grad_output.abs().max()
+
+            if can_fp8_quantize_analysis(fwd=False):
+                fp8_dtype_backward = get_fp8_te_dtype(ctx.fp8_meta["recipe"], fprop_tensor=False)
+
+                with paddle.no_grad():
+                    gather_grad_output = ctx.parallel_mode == "row" and ctx.sequence_parallel
+                    if (
+                        gather_grad_output
+                        and not ctx.fp8_meta["recipe"].override_linear_precision.wgrad
+                    ):
+                        grad_output_all, _ = allgather(grad_output, ctx.tp_group)
+                    else:
+                        grad_output_all = grad_output
+
+                get_fp8_quantize_analysis_helper().add_tensor(
+                    grad_output_all,
+                    fp8_tensor=grad_output_c,
+                    pname=weight.name,
+                    micro_step=ctx.micro_step,
+                    suffix="dy",
+                    fp8_dtype=int(fp8_dtype_backward),
+                    amax=amax,
+                    scale=ctx.fp8_meta["scaling_bwd"].scale[FP8BwdTensors.GRAD_OUTPUT1.value],
+                )
+
             if ctx.is_first_microbatch is not None:
                 accumulate_wgrad_into_param_main_grad = (
                     ctx.fuse_wgrad_accumulation and not ctx.is_first_microbatch
@@ -837,6 +941,7 @@ class Linear(TransformerEngineBaseLayer):
         self,
         inp: paddle.Tensor,
         is_first_microbatch: Optional[bool] = None,
+        micro_step=0,
     ) -> paddle.Tensor:
         """
         Apply the linear transformation to the input.
@@ -870,6 +975,7 @@ class Linear(TransformerEngineBaseLayer):
                 self.fuse_wgrad_accumulation,
                 is_first_microbatch,
                 self.gather_output,
+                micro_step,
             )
 
         if not self.gemm_bias_fused_add:
