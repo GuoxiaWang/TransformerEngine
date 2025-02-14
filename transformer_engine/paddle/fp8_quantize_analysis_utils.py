@@ -128,16 +128,19 @@ class FP8QuantizeAnalysisHelper:
         analysis_state["std"] = std.item()
         analysis_state["step"] = self.step
         analysis_state["layer_idx"] = layer_idx
-        analysis_state["pname"] = pname
-        analysis_state["sname"] = self.get_structure_name(pname)
+        #analysis_state["pname"] = pname
+        #analysis_state["sname"] = self.get_structure_name(pname)
         analysis_state["micro_step"] = micro_step
 
+        values = []
         for key, value in analysis_state.items():
             if isinstance(value, paddle.Tensor):
                 analysis_state[key] = value.item()
+            values.append(analysis_state[key])
 
         # print(analysis_state)
-        self.state[analysis_state["sname"]].append(analysis_state)
+        #self.state[analysis_state["sname"]].append(analysis_state)
+        self.state[self.get_structure_name(pname)].append(values)
 
 
 fp8_quantize_analysis_helper = FP8QuantizeAnalysisHelper()
